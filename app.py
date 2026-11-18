@@ -161,7 +161,7 @@ def get_week_key(dt: pd.Timestamp) -> str:
     return f"{iso.year}-{iso.week:02d}"
 
 
-# --- 단일 자산 시뮬레이션 엔진 (백테스터 원본 로직 + 실전 수동 보정 통합) ---
+# --- 단일 자산 시뮬레이션 엔진 ---
 def simulate_asset_engine(
     raw_df: pd.DataFrame,
     start_date: datetime.date,
@@ -202,7 +202,6 @@ def simulate_asset_engine(
             effective_start = earliest_ov
 
     start_ts = pd.Timestamp(effective_start)
-    prior_df = raw_df[raw_df["Date"] < start_ts]
     df = raw_df[raw_df["Date"] >= start_ts].reset_index(drop=True)
     if df.empty:
         df = raw_df.tail(1).reset_index(drop=True)
@@ -210,15 +209,10 @@ def simulate_asset_engine(
     first_price = float(df.loc[0, "Close"])
     first_week = df.loc[0, "WeekKey"]
 
+    # 시작일이 포함된 주의 직전 주(all_weeks 기준)를 정확히 조회
     exact_prev_week_high = first_price
     exact_prev_week_low = first_price
-
-    if not prior_df.empty:
-        prior_last_week = prior_df.iloc[-1]["WeekKey"]
-        if prior_last_week != first_week and prior_last_week in weekly_stats:
-            exact_prev_week_high = weekly_stats[prior_last_week]["High"]
-            exact_prev_week_low = weekly_stats[prior_last_week]["Low"]
-    elif first_week in all_weeks:
+    if first_week in all_weeks:
         idx = all_weeks.index(first_week)
         if idx > 0:
             prev_wk = all_weeks[idx - 1]
@@ -245,8 +239,13 @@ def simulate_asset_engine(
     total_withdrawal = 0.0
 
     cur_week = first_week
-    cur_week_high = float(df.loc[0, "High"])
-    cur_week_low = float(df.loc[0, "Low"])
+    same_week_prior = raw_df[(raw_df["WeekKey"] == first_week) & (raw_df["Date"] < start_ts)]
+    if not same_week_prior.empty:
+        cur_week_high = max(float(same_week_prior["High"].max()), float(df.loc[0, "High"]))
+        cur_week_low = min(float(same_week_prior["Low"].min()), float(df.loc[0, "Low"]))
+    else:
+        cur_week_high = float(df.loc[0, "High"])
+        cur_week_low = float(df.loc[0, "Low"])
 
     last_rebal_date = df.loc[0, "Date"]
     prev_month = df.loc[0, "Date"].month
@@ -273,7 +272,8 @@ def simulate_asset_engine(
             cur_week_high = max(cur_week_high, high)
             cur_week_low = min(cur_week_low, low)
 
-        cash += cash * daily_interest
+        if i > 0:
+            cash += cash * daily_interest
 
         # 월초 적립 및 임계자산 초과 시 인출 (파이프라인 이체)
         withdrawn_today = 0.0
@@ -333,12 +333,12 @@ def simulate_asset_engine(
 
             shares = new_shares
             cash = new_cash
-        else:
+        elif i > 0:  # 투자 시작일 당일에는 초기 세팅만 유지하고 자동 매매 생략
             target_buy_price = exact_prev_week_low * buy_band
             target_sell_price = exact_prev_week_high * sell_band
 
             is_crossing_up_ma200 = False
-            if use_ma200 and i > 0 and not has_triggered_ma200 and buy_step == 1:
+            if use_ma200 and not has_triggered_ma200 and buy_step == 1:
                 prev_row = df.iloc[i - 1]
                 prev_ma200 = None if pd.isna(prev_row["MA200"]) else float(prev_row["MA200"])
                 if prev_ma200 is not None and cur_ma200 is not None:
@@ -981,7 +981,6 @@ with tab_stats:
         0.0,
     )
 
-    # 순수 외부 투입 원금 (TQQQ->UPRO 내부 이체액은 중복 제외)
     ext_principal = (
         t_stat["principal"]
         + u_stat["principal"]
