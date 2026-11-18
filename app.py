@@ -161,7 +161,7 @@ def get_week_key(dt: pd.Timestamp) -> str:
     return f"{iso.year}-{iso.week:02d}"
 
 
-# --- 단일 자산 시뮬레이션 엔진 (자동 체결 + 수동 수정/덮어쓰기 통합) ---
+# --- 단일 자산 시뮬레이션 엔진 (자동 체결 + 수동 수정/입금 원금 반영 통합) ---
 def simulate_asset_engine(
     raw_df: pd.DataFrame,
     start_date: datetime.date,
@@ -235,6 +235,7 @@ def simulate_asset_engine(
 
     total_extra_injected = 0.0
     total_monthly_injected = 0.0
+    total_manual_principal_delta = 0.0  # 수동 입금/보정으로 추가된 순수 원금 변동 누적
     total_withdrawal = 0.0
 
     cur_week = first_week
@@ -251,7 +252,7 @@ def simulate_asset_engine(
 
     daily_records = []
     withdrawals_by_date = {}
-    auto_events = []  # 자동 체결 발생 날짜 기록용
+    auto_events = []
 
     for i, row in df.iterrows():
         dt = row["Date"]
@@ -304,7 +305,7 @@ def simulate_asset_engine(
 
         trade_note = ""
 
-        # 1. 사용자가 수정(덮어쓰기)한 날짜인 경우: 자동 체결 대신 사용자 실전 체결값으로 1회만 반영
+        # 1. 사용자가 수정(덮어쓰기) 또는 수동 입력한 날짜
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
             action_type = ov.get("action", "auto")
@@ -312,13 +313,23 @@ def simulate_asset_engine(
             if action_type == "skip":
                 trade_note = "🚫 미체결 처리 (자동 체결 건너뜀)"
             else:
+                prev_tot_val = cash + (shares * close * fx_rate)
                 new_shares = int(ov["shares"])
                 ov_krw = float(ov.get("cash_krw", 0))
                 ov_usd = float(ov.get("cash_usd", 0.0))
                 new_cash = ov_krw + (ov_usd * fx_rate)
+                new_tot_val = new_cash + (new_shares * close * fx_rate)
                 cash_desc = f"{ov_krw:,.0f}원 + ${ov_usd:,.2f}" if ov_usd > 0 else f"{ov_krw:,.0f}원"
 
-                if action_type == "buy" or (action_type == "auto" and new_shares > shares):
+                if action_type == "deposit":
+                    delta_val = new_tot_val - prev_tot_val
+                    total_manual_principal_delta += delta_val
+                    sign = "+" if delta_val >= 0 else ""
+                    trade_note = f"💵 입출금 원금반영 ({sign}{delta_val:,.0f}원 → {new_shares:,}주 / {cash_desc})"
+                elif action_type == "buy" or (action_type == "auto" and new_shares > shares):
+                    # 기존 보유 자산이 0원이었는데 새로 주식을 넣어 시작한 경우 원금으로 인정
+                    if prev_tot_val == 0 and new_tot_val > 0:
+                        total_manual_principal_delta += new_tot_val
                     disp_step = min(buy_step, tot_buy_steps)
                     trade_note = f"✏️ 실전 매수 {disp_step}단계 ({new_shares:,}주 / {cash_desc})"
                     buy_step = min(tot_buy_steps + 1, buy_step + 1)
@@ -340,12 +351,19 @@ def simulate_asset_engine(
                     has_triggered_ma200 = False
                     last_traded_week = week_num
                 else:
-                    trade_note = f"✏️ 실전 잔고 보정 ({new_shares:,}주 / {cash_desc})"
+                    # 단순 잔고보정(adjust) 또는 수량 변화 없는 입금(auto): 순자산 증감분을 원금에 반영
+                    delta_val = new_tot_val - prev_tot_val
+                    if abs(delta_val) >= 1000:
+                        total_manual_principal_delta += delta_val
+                        sign = "+" if delta_val >= 0 else ""
+                        trade_note = f"✏️ 실전 잔고·원금 반영 ({sign}{delta_val:,.0f}원 · {new_shares:,}주 / {cash_desc})"
+                    else:
+                        trade_note = f"✏️ 실전 잔고 보정 ({new_shares:,}주 / {cash_desc})"
 
                 shares = new_shares
                 cash = new_cash
 
-        # 2. 수정되지 않은 날짜는 계속 자동 체결 엔진이 정상 작동
+        # 2. 수정되지 않은 날짜는 계속 자동 체결 엔진 작동
         elif i > 0:
             target_buy_price = exact_prev_week_low * buy_band
             target_sell_price = exact_prev_week_high * sell_band
@@ -495,12 +513,14 @@ def simulate_asset_engine(
         + initial_total_cash_krw
         + total_monthly_injected
         + total_extra_injected
+        + total_manual_principal_delta
     )
 
     return res_df, withdrawals_by_date, {
-        "principal": round(principal),
+        "principal": round(max(0.0, principal)),
         "extra_in": total_extra_injected,
         "monthly_in": total_monthly_injected,
+        "manual_in": total_manual_principal_delta,
         "withdrawn": total_withdrawal,
         "final_bal": float(res_df["계좌잔고(원)"].iloc[-1]),
         "final_real": float(res_df["실질총자산(원)"].iloc[-1]),
@@ -932,15 +952,13 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 자동 체결 내역 수정 및 실전 잔고 반영")
-    st.caption("자동 체결된 날짜를 선택해 실제 수량·예수금으로 덮어쓰거나, 미체결 처리할 수 있습니다.")
+    st.caption("자동 체결된 날짜를 덮어쓰거나, 추가 입금·실전 잔고를 반영하면 성과/원금에도 자동 합산됩니다.")
 
-    # 종목 선택을 폼 바깥에 두어 선택 즉시 해당 종목의 최신 체결 내역을 불러옴
     target_ticker = st.radio("수정할 종목 선택", ["TQQQ", "UPRO"], horizontal=True)
     cur_stat = t_stat if target_ticker == "TQQQ" else u_stat
     cur_ov_dict = t_ov if target_ticker == "TQQQ" else u_ov
     cur_auto_events = cur_stat["auto_events"]
 
-    # 최근 자동 체결일 또는 수동 수정일이 있으면 기본 날짜로 제안
     default_edit_date = datetime.date.fromisoformat(latest_db_date)
     default_sh = cur_stat["last_shares"]
     default_krw = cur_stat["last_cash"]
@@ -970,10 +988,11 @@ with tab_order:
         )
         m_action = fc2.selectbox(
             "체결 구분",
-            options=["auto", "buy", "sell", "rebal", "skip", "adjust"],
+            options=["auto", "deposit", "buy", "sell", "rebal", "skip", "adjust"],
             index=default_act_idx,
             format_func=lambda x: {
-                "auto": "자동판별 (수량증감)",
+                "auto": "자동판별 (증감반영)",
+                "deposit": "💵 입출금 (원금반영)",
                 "buy": "🟢 매수체결 (덮어쓰기)",
                 "sell": "🔴 매도체결 (덮어쓰기)",
                 "rebal": "⚖️ 리밸런싱",
@@ -1012,7 +1031,6 @@ with tab_order:
             else:
                 st.rerun()
 
-    # 수정된 기록 목록 및 개별/전체 복구
     if t_ov or u_ov:
         with st.expander("📝 수동 수정된 내역 관리 (개별 복구 가능)", expanded=False):
             for tk in ("TQQQ", "UPRO"):
