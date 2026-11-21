@@ -205,7 +205,7 @@ def get_week_key(dt: pd.Timestamp) -> str:
     return f"{iso.year}-{iso.week:02d}"
 
 
-# --- 단일 자산 시뮬레이션 엔진 (실시간 환율 + 달러/원화 예수금 분리 + 수동 수정 통합) ---
+# --- 단일 자산 시뮬레이션 엔진 (실시간 환율 + 달러/원화 예수금 분리 + 수동 수정 + 위기추가금 통합) ---
 def simulate_asset_engine(
     raw_df: pd.DataFrame,
     start_date: datetime.date,
@@ -594,7 +594,11 @@ def simulate_asset_engine(
     next_buy_p = ref_low * buy_band
     next_sell_p = ref_high * sell_band
 
-    latest_tot_cash_usd = cash_usd + (cash_krw / latest_fx)
+    # 다음 매수 회차가 추가투입 회차(extra_step)와 일치하면 위기추가금(extra_amt) 합산
+    is_extra_next = (extra_step > 0 and buy_step == extra_step and extra_amt > 0)
+    upcoming_extra_krw = extra_amt if is_extra_next else 0.0
+    latest_tot_cash_usd = cash_usd + ((cash_krw + upcoming_extra_krw) / latest_fx)
+
     if buy_step <= tot_buy_steps and next_buy_p > 0:
         next_buy_f = 1.0 / (tot_buy_steps - buy_step + 1)
         next_buy_sh = max(0, math.floor((latest_tot_cash_usd * next_buy_f) / next_buy_p))
@@ -638,6 +642,8 @@ def simulate_asset_engine(
         "next_sell_sh": next_sell_sh,
         "buy_step": buy_step,
         "sell_step": sell_step,
+        "is_extra_next": is_extra_next,
+        "upcoming_extra_krw": upcoming_extra_krw,
         "last_note": daily_records[-1]["매매기록"] or "🔍 관망 (그리드 밴드 대기 중)",
         "auto_events": auto_events,
     }
@@ -1006,12 +1012,27 @@ u_res, _, u_stat = simulate_asset_engine(
 active_fx = t_stat["latest_fx"]
 
 
-def render_order_card(ticker: str, stat: dict, buy_band_pct: float, sell_band_pct: float, buy_steps: int, stock_ratio: int):
+def render_order_card(
+    ticker: str,
+    stat: dict,
+    buy_band_pct: float,
+    sell_band_pct: float,
+    buy_steps: int,
+    stock_ratio: int,
+):
     buy_est_usd = stat["next_buy_p"] * stat["next_buy_sh"]
     buy_est_krw = round(buy_est_usd * active_fx)
     sell_est_usd = stat["next_sell_p"] * stat["next_sell_sh"]
     sell_est_krw = round(sell_est_usd * active_fx)
     buy_step_label = f"{stat['buy_step']}단계" if stat["buy_step"] <= buy_steps else "분할완료"
+
+    extra_tag = ""
+    if stat.get("is_extra_next") and stat.get("upcoming_extra_krw", 0) > 0:
+        extra_tag = (
+            f"<div style='font-size:0.73rem; color:#d97706; font-weight:700; margin-top:4px;'>"
+            f"🆘 위기추가금 +{stat['upcoming_extra_krw']:,.0f}원 투입 대상"
+            f"</div>"
+        )
 
     st.markdown(
         f"""
@@ -1042,6 +1063,7 @@ def render_order_card(ticker: str, stat: dict, buy_band_pct: float, sell_band_pc
                 <div style="font-size:1.35rem; font-weight:800; margin:3px 0;">${stat['next_buy_p']:.2f}</div>
                 <div style="font-weight:700; font-size:0.88rem;">🛒 매수 {stat['next_buy_sh']}주 ({buy_step_label})</div>
                 <div style="font-size:0.74rem; margin-top:3px; opacity:0.85;">예상 ${buy_est_usd:,.1f} ({buy_est_krw:,}원)</div>
+                {extra_tag}
             </div>
             """,
             unsafe_allow_html=True,
