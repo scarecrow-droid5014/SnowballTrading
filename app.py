@@ -130,15 +130,40 @@ def save_user_to_github(username: str, pin_hash: str, cfg: dict, overrides: dict
         return sha, f"GitHub 저장 실패 ({put_res.status_code}): {put_res.text}"
 
 
+# --- 캐시 버킷 계산 (토요일 정오 12시 이전 5분 단위, 정오 이후 자동 갱신) ---
+def get_cache_bucket() -> str:
+    now_kst = pd.Timestamp.now(tz="Asia/Seoul")
+    if now_kst.weekday() == 5 and now_kst.hour < 12:
+        return f"sat_am_{now_kst.strftime('%Y%m%d_%H')}_{now_kst.minute // 5}"
+    return f"normal_{now_kst.strftime('%Y%m%d_%H')}"
+
+
+# --- 실시간 최신 원/달러 환율 조회 ---
+def fetch_realtime_fx() -> float | None:
+    try:
+        ticker = yf.Ticker("KRW=X")
+        last_price = ticker.fast_info.get("lastPrice")
+        if last_price and float(last_price) > 500:
+            return float(last_price)
+        intraday = ticker.history(period="1d", interval="1m")
+        if intraday is not None and not intraday.empty:
+            return float(intraday["Close"].iloc[-1])
+    except Exception:
+        pass
+    return None
+
+
 # --- 주가 및 실시간 환율 데이터 수집 ---
 @st.cache_data(ttl=1800)
-def load_market_data():
+def load_market_data(cache_bucket: str):
     tqqq = yf.download("TQQQ", period="5y", interval="1d", progress=False, auto_adjust=False)
     upro = yf.download("UPRO", period="5y", interval="1d", progress=False, auto_adjust=False)
     fx_raw = yf.download("KRW=X", period="5y", interval="1d", progress=False, auto_adjust=False)
 
     if tqqq is None or upro is None or tqqq.empty or upro.empty:
         return pd.DataFrame(), pd.DataFrame()
+
+    live_fx_now = fetch_realtime_fx()
 
     fx_df = pd.DataFrame()
     if fx_raw is not None and not fx_raw.empty:
@@ -158,9 +183,14 @@ def load_market_data():
         df["MA200"] = df["Close"].rolling(window=200).mean()
         if not fx_df.empty:
             df = pd.merge_asof(df, fx_df, on="Date", direction="backward")
-            df["FX"] = df["FX"].bfill().fillna(1350.0)
+            df["FX"] = df["FX"].bfill().fillna(live_fx_now or 1350.0)
         else:
-            df["FX"] = 1350.0
+            df["FX"] = live_fx_now or 1350.0
+
+        # 가장 최근 영업일의 환율을 실시간 호가로 동기화
+        if live_fx_now is not None and not df.empty:
+            df.loc[df.index[-1], "FX"] = live_fx_now
+
         processed.append(df)
 
     t_df, u_df = processed[0], processed[1]
@@ -616,7 +646,7 @@ def simulate_asset_engine(
 # --- UI 렌더링 ---
 st.title("❄️ TQQQ → UPRO 스노우볼 매매 앱")
 
-t_df_raw, u_df_raw = load_market_data()
+t_df_raw, u_df_raw = load_market_data(get_cache_bucket())
 if t_df_raw.empty or u_df_raw.empty:
     st.error("야후 파이낸스에서 TQQQ / UPRO 주가 데이터를 불러오지 못했습니다.")
     st.stop()
@@ -626,6 +656,10 @@ current_live_fx = float(t_df_raw.iloc[-1]["FX"])
 min_db_date = t_df_raw.iloc[0]["Date"].date()
 max_db_date = t_df_raw.iloc[-1]["Date"].date()
 st.caption(f"TQQQ(U23) → UPRO(U10) 전이 보조 · 실시간 환율 {current_live_fx:,.1f}원 · 기준일: {latest_db_date}")
+
+now_kst = pd.Timestamp.now(tz="Asia/Seoul")
+if now_kst.weekday() == 5 and now_kst.hour < 12:
+    st.warning("⏳ 현재 미국 장 마감 정산 중입니다. 정확한 차주 주문가는 **토요일 낮 12:00 이후**에 최종 확정됩니다.")
 
 DEFAULT_CFG = {
     "sd": max_db_date.isoformat(),
