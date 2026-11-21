@@ -1,7 +1,7 @@
 {
   "username": "lucas",
   "pin_hash": "c3b109c7b1e3166e66534af6e523467c76570ef32d0fa8cf52c0d2fe97719d7e",
-  "updated_at": "2026-11-21 00:07:27",
+  "updated_at": "2026-11-21 04:27:02",
   "cfg": {
     "sd": "2026-11-04",
     "live_fx": true,
@@ -53,6 +53,12 @@
       "2026-11-13": {
         "shares": 0,
         "cash_krw": 1000000,
+        "cash_usd": 0.0,
+        "action": "auto"
+      },
+      "2026-11-17": {
+        "shares": 1,
+        "cash_krw": 832764,
         "cash_usd": 0.0,
         "action": "auto"
       }
